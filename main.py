@@ -4,80 +4,99 @@ import asyncio
 import pymongo
 from threading import Thread
 from flask import Flask
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, User
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # --- 1. CONFIGURATION ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN") 
 MONGO_URL = os.getenv("MONGO_URL")
-OWNER_ID = 123456789  # Apna User ID yahan daal
+OWNER_ID = 6356015122 
 
 # --- 2. DATABASE CONNECTION ---
 try:
     client = pymongo.MongoClient(MONGO_URL)
     db = client["CasinoBot"]
     users_col = db["users"]
+    codes_col = db["codes"]
     print("✅ Database Connected!")
 except Exception as e:
     print(f"❌ DB Error: {e}")
 
-# --- 3. FLASK SERVER (24/7 UPTIME) ---
+# --- 3. FLASK SERVER ---
 app = Flask('')
-
 @app.route('/')
-def home():
-    return "Mines Bot is Running! 💣"
+def home(): return "Mines Bot is Running! 💣"
+def run(): app.run(host='0.0.0.0', port=8080)
+def keep_alive(): t = Thread(target=run); t.start()
 
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-# --- 4. GAME SETTINGS ---
+# --- 4. GAME & SHOP SETTINGS ---
 GRID_SIZE = 4
-TOTAL_BOMBS = 3
-MULTIPLIERS = [1.0, 1.15, 1.4, 1.7, 2.1, 2.6, 3.2, 4.0, 5.5, 7.5, 10.0, 15.0]
-
-# RAM me game save karenge
+BOMB_CONFIG = {
+    1:  [1.01, 1.08, 1.15, 1.25, 1.40, 1.55, 1.75, 2.0, 2.5, 3.0, 4.0, 5.0], 
+    3:  [1.10, 1.25, 1.45, 1.75, 2.15, 2.65, 3.30, 4.2, 5.5, 7.5, 10.0, 15.0], 
+    5:  [1.30, 1.65, 2.20, 3.00, 4.20, 6.00, 9.00, 14.0, 22.0, 35.0, 50.0],    
+    10: [2.50, 4.50, 9.00, 18.0, 40.0, 80.0]                                   
+}
 active_games = {} 
+MAX_LOAN = 5000
+LOAN_INTEREST = 0.10
+
+# 🛍️ SHOP ITEMS LIST
+SHOP_ITEMS = {
+    "vip":   {"name": "👑 VIP Player", "price": 10000},
+    "🎖️":   {"name": "🎖️VIP 2",    "price": 50000},
+    "king":  {"name": "🦁 Lion King",  "price": 100000},
+    "god":   {"name": "⚡ God Mode",   "price": 500000},
+    "hacker":{"name": "👨‍💻 Hacker",    "price": 1000000}
+}
 
 # --- 5. HELPER FUNCTIONS ---
 def get_user(user_id, name):
     user = users_col.find_one({"_id": user_id})
     if not user:
-        user = {"_id": user_id, "name": name, "balance": 1000} 
+        user = {
+            "_id": user_id, 
+            "name": name, 
+            "balance": 1000, 
+            "loan": 0, 
+            "redeemed_codes": [],
+            "titles": [] # New Field for Shop
+        } 
         users_col.insert_one(user)
     return user
 
 def update_balance(user_id, amount):
-    # upsert=True zaroori hai taki agar user DB me na ho to ban jaye
     users_col.update_one({"_id": user_id}, {"$inc": {"balance": amount}}, upsert=True)
 
 def get_balance(user_id):
     user = users_col.find_one({"_id": user_id})
     return user["balance"] if user else 0
 
+async def delete_message_job(context: ContextTypes.DEFAULT_TYPE):
+    job = context.job
+    try: await context.bot.delete_message(chat_id=job.chat_id, message_id=job.data)
+    except: pass
+
 # --- 6. GAME LOGIC ---
-def create_board():
+def create_board(mines_count):
     cells = [0] * (GRID_SIZE * GRID_SIZE)
-    bomb_indices = random.sample(range(len(cells)), TOTAL_BOMBS)
-    for idx in bomb_indices:
-        cells[idx] = 1
+    bomb_indices = random.sample(range(len(cells)), mines_count)
+    for idx in bomb_indices: cells[idx] = 1
     return cells
 
 def get_keyboard(game_data, game_over=False):
     grid = game_data["grid"]
     revealed = game_data["revealed"]
-    keyboard = []
+    user_id = game_data["user_id"]
+    mines = game_data["mines"]
+    multipliers = BOMB_CONFIG.get(mines, BOMB_CONFIG[3])
     
+    keyboard = []
     for row in range(GRID_SIZE):
         row_btns = []
         for col in range(GRID_SIZE):
             index = row * GRID_SIZE + col
-            
             if game_over:
                 text = "💣" if grid[index] == 1 else "💎"
                 callback = "noop"
@@ -86,217 +105,259 @@ def get_keyboard(game_data, game_over=False):
                 callback = "noop"
             else:
                 text = "🟦"
-                # IMPORTANT: Callback me UserID bhi daal rahe hain group security ke liye
-                callback = f"click_{index}_{game_data['user_id']}"
-            
+                callback = f"click_{index}_{user_id}"
             row_btns.append(InlineKeyboardButton(text, callback_data=callback))
         keyboard.append(row_btns)
     
     if not game_over:
-        current_mult = MULTIPLIERS[len(revealed)]
+        if len(revealed) > 0:
+            current_mult = multipliers[len(revealed) - 1]
+        else:
+            current_mult = 1.0
         win_amount = int(game_data["bet"] * current_mult)
-        # Cashout me bhi UserID joda
-        keyboard.append([InlineKeyboardButton(f"💰 Cashout (₹{win_amount})", callback_data=f"cashout_{game_data['user_id']}")])
         
+        keyboard.append([InlineKeyboardButton(f"💰 Cashout (₹{win_amount})", callback_data=f"cashout_{user_id}")])
+        keyboard.append([InlineKeyboardButton("❌ Quit", callback_data=f"close_{user_id}")])
+    else:
+        keyboard.append([InlineKeyboardButton("❌ Close Message", callback_data=f"close_{user_id}")])
     return InlineKeyboardMarkup(keyboard)
 
-# --- 7. USER COMMANDS ---
+# --- 7. COMMAND HANDLERS ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    # Ensure user DB me hai
-    get_user(user.id, user.first_name)
+    data = get_user(user.id, user.first_name)
+    
+    # Show Titles
+    titles = " | ".join(data.get("titles", []))
+    if not titles: titles = "No Titles"
     
     await update.message.reply_text(
         f"👋 **Welcome {user.first_name}!**\n\n"
-        "🎮 **Mines Group Bot**\n"
-        "💰 Aapke paas **1000 Coins** hain!\n\n"
-        "📜 **Commands:**\n"
-        "`/bet 100` - Game khelo\n"
-        "`/pay` - Reply karke paise bhejo\n"
-        "`/balance` - Balance check\n"
-        "`/top` - Leaderboard",
+        f"🏷 **Titles:** {titles}\n"
+        f"💰 **Balance:** ₹{data['balance']}\n\n"
+        "🎮 Use `/bet 100` to Play\n"
+        "🛒 Use `/shop` to Buy Titles",
         parse_mode=ParseMode.MARKDOWN
     )
 
-async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bal = get_balance(update.effective_user.id)
-    await update.message.reply_text(f"💳 **{update.effective_user.first_name}**, Aapka Balance: ₹{bal}", parse_mode=ParseMode.MARKDOWN)
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "📚 **COMMAND LIST**\n\n"
+        "🎮 `/bet 100` - Game Khelo\n"
+        "🛒 `/shop` - Titles Khareedo\n"
+        "🎒 `/myitems` - Apni Inventory Dekho\n"
+        "💳 `/balance` - Paisa Dekho\n"
+        "🎁 `/redeem <code>` - Promo Code\n"
+        "💸 `/pay <amount>` - Transfer Money\n"
+        "🏦 `/loan <amount>` - Take Loan\n"
+        "🔙 `/payloan` - Repay Loan"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-async def daily(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    update_balance(user_id, 200)
-    await update.message.reply_text(f"☀️ **Daily Bonus!** ₹200 added to {update.effective_user.first_name}.", parse_mode=ParseMode.MARKDOWN)
-
-# --- FIXED PAY COMMAND ---
-async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # 1. Check karo ki reply kiya hai ya nahi
-    if not update.message.reply_to_message:
-        await update.message.reply_text("❌ Kisi ke message par **Reply** karke `/pay 100` likho.")
-        return
-    
-    try:
-        # 2. Amount aur Users nikalo
-        amount = int(context.args[0])
-        sender = update.effective_user
-        receiver = update.message.reply_to_message.from_user
-        
-        # 3. Validation checks
-        if sender.id == receiver.id:
-            await update.message.reply_text("❌ Khud ko paise nahi bhej sakte!")
-            return
-            
-        if receiver.is_bot:
-            await update.message.reply_text("❌ Bot ko paise nahi de sakte!")
-            return
-            
-        if amount <= 0:
-            await update.message.reply_text("❌ Sahi amount daalo (e.g., 50, 100).")
-            return
-
-        sender_bal = get_balance(sender.id)
-        if sender_bal < amount:
-            await update.message.reply_text(f"❌ **Low Balance!** Aapke paas sirf ₹{sender_bal} hain.")
-            return
-        
-        # 4. Transaction (Yaha galti thi pehle)
-        # Receiver ko pehle DB me ensure karo (Agar naya user hai to create ho jaye)
-        get_user(receiver.id, receiver.first_name)
-        
-        # Paise kato aur jodo
-        update_balance(sender.id, -amount)
-        update_balance(receiver.id, amount)
-        
-        # 5. Success Message (Group Tagging)
-        await update.message.reply_text(
-            f"✅ **Transaction Successful!**\n\n"
-            f"💸 **Sender:** {sender.mention_html()}\n"
-            f"💰 **Receiver:** {receiver.mention_html()}\n"
-            f"💵 **Amount:** ₹{amount}",
-            parse_mode=ParseMode.HTML
-        )
-        
-    except (IndexError, ValueError):
-        await update.message.reply_text("⚠️ Usage: Reply karke `/pay 100` likho.")
-
-# --- /BET COMMAND (Renamed from /play) ---
-async def bet_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# --- SHOP COMMANDS ---
+async def shop_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    try:
-        bet_amount = int(context.args[0])
-    except:
-        await update.message.reply_text("⚠️ **Usage:** `/bet 100`")
-        return
+    keyboard = []
     
-    if bet_amount < 10:
-        await update.message.reply_text("❌ Min Bet: ₹10")
-        return
-
-    bal = get_balance(user.id)
-    if bal < bet_amount:
-        await update.message.reply_text(f"❌ **Gareeb!** Tere paas sirf ₹{bal} hain.")
-        return
+    # Generate Shop Buttons
+    for key, item in SHOP_ITEMS.items():
+        btn_text = f"{item['name']} - ₹{item['price']}"
+        keyboard.append([InlineKeyboardButton(btn_text, callback_data=f"buy_{key}_{user.id}")])
     
-    # Paisa kato
-    update_balance(user.id, -bet_amount)
-    
-    # Game start
-    grid = create_board()
-    game_id = f"{user.id}"
-    active_games[game_id] = {
-        "grid": grid,
-        "revealed": [],
-        "bet": bet_amount,
-        "user_id": user.id,
-        "name": user.first_name
-    }
+    keyboard.append([InlineKeyboardButton("❌ Close Shop", callback_data=f"close_{user.id}")])
     
     await update.message.reply_text(
-        f"💣 **Mines Started!**\n👤 Player: {user.first_name}\n💰 Bet: ₹{bet_amount}",
-        reply_markup=get_keyboard(active_games[game_id])
+        "🛒 **VIP SHOP**\n\nCoins kharch karo aur Titles paao!",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode=ParseMode.MARKDOWN
     )
 
-# --- GROUP SECURE CALLBACK ---
-async def game_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def my_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    data = get_user(user.id, user.first_name)
+    titles = data.get("titles", [])
+    
+    if not titles:
+        await update.message.reply_text("🎒 **Inventory Empty!**\n`/shop` se kuch khareedo gareeb! 😂", parse_mode=ParseMode.MARKDOWN)
+    else:
+        items_list = "\n".join([f"✅ {t}" for t in titles])
+        await update.message.reply_text(f"🎒 **YOUR TITLES:**\n\n{items_list}", parse_mode=ParseMode.MARKDOWN)
+
+# --- OTHER COMMANDS ---
+async def bet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    try: bet_amount = int(context.args[0])
+    except: await update.message.reply_text("⚠️ Usage: `/bet 100`"); return
+    if bet_amount < 10: await update.message.reply_text("Min Bet: ₹10"); return
+    bal = get_balance(user.id)
+    if bal < bet_amount: await update.message.reply_text(f"❌ Low Balance: ₹{bal}"); return
+
+    keyboard = [
+        [InlineKeyboardButton("🟢 1 Bomb", callback_data=f"select_1_{bet_amount}_{user.id}"), InlineKeyboardButton("🟡 3 Bombs", callback_data=f"select_3_{bet_amount}_{user.id}")],
+        [InlineKeyboardButton("🔴 5 Bombs", callback_data=f"select_5_{bet_amount}_{user.id}"), InlineKeyboardButton("💀 10 Bombs", callback_data=f"select_10_{bet_amount}_{user.id}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"close_{user.id}")]
+    ]
+    await update.message.reply_text(f"⚙️ **Difficulty Select**\nBet: ₹{bet_amount}", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def take_loan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    u = get_user(user.id, user.first_name)
+    if u.get("loan", 0) > 0: await update.message.reply_text("❌ Loan Active!"); return
+    try: amt = int(context.args[0])
+    except: return
+    if amt > MAX_LOAN: return
+    repay = int(amt + (amt*LOAN_INTEREST))
+    users_col.update_one({"_id": user.id}, {"$inc": {"balance": amt}, "$set": {"loan": repay}})
+    await update.message.reply_text(f"✅ Loan Taken: ₹{amt}")
+
+async def pay_loan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    u = users_col.find_one({"_id": user.id})
+    if u.get("balance", 0) < u.get("loan", 0): await update.message.reply_text("❌ Low Balance"); return
+    users_col.update_one({"_id": user.id}, {"$inc": {"balance": -u["loan"]}, "$set": {"loan": 0}})
+    await update.message.reply_text("✅ Loan Repaid!")
+
+async def balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"💳 Balance: ₹{get_balance(update.effective_user.id)}")
+
+async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message.reply_to_message: return
+    try:
+        amt = int(context.args[0])
+        sender = update.effective_user; receiver = update.message.reply_to_message.from_user
+        if sender.id == receiver.id or amt <= 0: return
+        if get_balance(sender.id) < amt: return
+        get_user(receiver.id, receiver.first_name)
+        update_balance(sender.id, -amt); update_balance(receiver.id, amt)
+        await update.message.reply_text(f"✅ Sent ₹{amt}")
+    except: pass
+
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    if not context.args: return
+    message = " ".join(context.args)
+    users = users_col.find({})
+    for user in users:
+        try: await context.bot.send_message(chat_id=user["_id"], text=f"📢 **ANNOUNCEMENT**\n\n{message}", parse_mode=ParseMode.MARKDOWN)
+        except: pass
+    await update.message.reply_text("✅ Broadcast Sent.")
+
+async def create_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID: return
+    try:
+        code_name = context.args[0]; amount = int(context.args[1]); limit = int(context.args[2])
+        codes_col.insert_one({"code": code_name, "amount": amount, "limit": limit, "redeemed_by": []})
+        await update.message.reply_text(f"✅ Code Created: {code_name}")
+    except: pass
+
+async def redeem_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    try: code_name = context.args[0]
+    except: return
+    code_data = codes_col.find_one({"code": code_name})
+    if not code_data or len(code_data["redeemed_by"]) >= code_data["limit"] or user_id in code_data["redeemed_by"]:
+        await update.message.reply_text("❌ Invalid or Used Code"); return
+    update_balance(user_id, code_data["amount"])
+    codes_col.update_one({"code": code_name}, {"$push": {"redeemed_by": user_id}})
+    await update.message.reply_text(f"🎉 Redeemed ₹{code_data['amount']}!")
+
+async def add_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id == OWNER_ID:
+        try: update_balance(int(context.args[0]), int(context.args[1])); await update.message.reply_text("Done")
+        except: pass
+
+async def take_money(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id == OWNER_ID:
+        try: update_balance(int(context.args[0]), -int(context.args[1])); await update.message.reply_text("Done")
+        except: pass
+
+# --- CALLBACKS (GAME + SHOP) ---
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
-    
-    # noop = No Operation (Khula hua box ya bomb dikhane ke liye)
-    if data == "noop":
-        await query.answer()
-        return
-
-    # Data format: "action_index_userid" (e.g., click_5_123456)
+    if data == "noop": await query.answer(); return
     parts = data.split("_")
     action = parts[0]
-    
-    # Security Check: Kya ye wahi user hai jisne game start kiya?
-    game_owner_id = int(parts[-1])
-    clicker_id = query.from_user.id
-    
-    if clicker_id != game_owner_id:
-        await query.answer("❌ Ye aapka game nahi hai! Apna `/bet` lagao.", show_alert=True)
+
+    # --- SHOP LOGIC ---
+    if action == "buy":
+        item_key = parts[1]
+        buyer_id = int(parts[2])
+        
+        if query.from_user.id != buyer_id: await query.answer("Apna shop kholo!", show_alert=True); return
+        
+        item = SHOP_ITEMS.get(item_key)
+        if not item: return
+
+        # Check Balance & Ownership
+        user_data = users_col.find_one({"_id": buyer_id})
+        if item["name"] in user_data.get("titles", []):
+            await query.answer("⚠️ Ye pehle se hai tumhare paas!", show_alert=True); return
+            
+        if user_data["balance"] < item["price"]:
+            await query.answer(f"❌ Paisa nahi hai! Need ₹{item['price']}", show_alert=True); return
+            
+        # Purchase
+        update_balance(buyer_id, -item["price"])
+        users_col.update_one({"_id": buyer_id}, {"$push": {"titles": item["name"]}})
+        await query.answer(f"🎉 Purchased: {item['name']}", show_alert=True)
+        await query.edit_message_text(f"✅ **Bought:** {item['name']}\nInventory check karo: `/myitems`", parse_mode=ParseMode.MARKDOWN)
         return
 
-    game_id = f"{game_owner_id}"
-    
-    if game_id not in active_games:
-        await query.answer("❌ Game Expired!", show_alert=True)
+    # --- GAME LOGIC ---
+    if action == "select":
+        mines = int(parts[1]); bet = int(parts[2]); owner = int(parts[3])
+        if query.from_user.id != owner: await query.answer("Not your game!", show_alert=True); return
+        if get_balance(owner) < bet: await query.answer("No Money!", show_alert=True); await query.message.delete(); return
+        update_balance(owner, -bet)
+        grid = create_board(mines)
+        active_games[f"{owner}"] = {"grid": grid, "revealed": [], "bet": bet, "user_id": owner, "mines": mines}
+        await query.edit_message_text(f"💣 Mines ({mines})\n💰 Bet: {bet}", reply_markup=get_keyboard(active_games[f"{owner}"]))
         return
+
+    owner = int(parts[-1]); clicker = query.from_user.id
+    if action == "close": 
+        if f"{owner}" in active_games: del active_games[f"{owner}"]
+        await query.message.delete(); return
     
-    game = active_games[game_id]
-    
-    if action == "cashout":
-        revealed_count = len(game["revealed"])
-        if revealed_count == 0:
-            await query.answer("❌ 1 Box toh kholo!", show_alert=True)
-            return
-            
-        mult = MULTIPLIERS[revealed_count]
-        winnings = int(game["bet"] * mult)
-        update_balance(game_owner_id, winnings)
-        del active_games[game_id]
+    if clicker != owner: await query.answer("Not your game!", show_alert=True); return
         
-        await query.edit_message_text(f"🤑 **{game['name']} Won: ₹{winnings}**\n(Multiplier: {mult}x)")
+    game_id = f"{owner}"
+    if game_id not in active_games: await query.answer("Expired", show_alert=True); return
+    game = active_games[game_id]
+    multipliers = BOMB_CONFIG.get(game["mines"], BOMB_CONFIG[3])
+
+    if action == "cashout":
+        if not game["revealed"]: await query.answer("Open 1 box!", show_alert=True); return
+        mult = multipliers[len(game["revealed"])-1]
+        win = int(game["bet"]*mult)
+        update_balance(owner, win)
+        del active_games[game_id]
+        await query.edit_message_text(f"🤑 Won: ₹{win}\n🗑 Deleting...", reply_markup=get_keyboard(game, True))
+        context.job_queue.run_once(delete_message_job, 30, chat_id=query.message.chat_id, data=query.message.message_id)
         return
 
     if action == "click":
-        index = int(parts[1])
-        
-        if game["grid"][index] == 1: # BOMB
+        idx = int(parts[1])
+        if game["grid"][idx] == 1:
             del active_games[game_id]
-            game["revealed"].append(index)
-            await query.edit_message_text(
-                f"💥 **BOOM! {game['name']} Lost!**\n💸 ₹{game['bet']} gaye paani me.", 
-                reply_markup=get_keyboard(game, game_over=True)
-            )
-        else: # SAFE
-            if index not in game["revealed"]:
-                game["revealed"].append(index)
-            
-            safe_cells = (GRID_SIZE * GRID_SIZE) - TOTAL_BOMBS
-            
-            if len(game["revealed"]) == safe_cells:
-                mult = MULTIPLIERS[-1]
-                winnings = int(game["bet"] * mult)
-                update_balance(game_owner_id, winnings)
+            game["revealed"].append(idx)
+            await query.edit_message_text(f"💥 BOOM! Lost ₹{game['bet']}\n🗑 Deleting...", reply_markup=get_keyboard(game, True))
+            context.job_queue.run_once(delete_message_job, 30, chat_id=query.message.chat_id, data=query.message.message_id)
+        else:
+            if idx not in game["revealed"]: game["revealed"].append(idx)
+            safe = (GRID_SIZE*GRID_SIZE) - game["mines"]
+            if len(game["revealed"]) == safe:
+                mult = multipliers[-1] if len(game["revealed"])-1 < len(multipliers) else multipliers[-1]
+                win = int(game["bet"]*mult)
+                update_balance(owner, win)
                 del active_games[game_id]
-                await query.edit_message_text(f"👑 **JACKPOT! {game['name']} Won: ₹{winnings}**")
+                await query.edit_message_text(f"👑 JACKPOT! Won ₹{win}")
+                context.job_queue.run_once(delete_message_job, 30, chat_id=query.message.chat_id, data=query.message.message_id)
             else:
-                await query.edit_message_text(
-                    f"💎 **Safe!** Next: {MULTIPLIERS[len(game['revealed'])]}x",
-                    reply_markup=get_keyboard(game)
-                )
-
-# --- LEADERBOARD ---
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    top_users = users_col.find().sort("balance", -1).limit(10)
-    text = "🏆 **TOP 10 RICH LIST** 🏆\n\n"
-    rank = 1
-    for user in top_users:
-        text += f"#{rank} {user['name']} : ₹{user['balance']}\n"
-        rank += 1
-    await update.message.reply_text(text)
+                next_mult = multipliers[len(game["revealed"])] if len(game["revealed"]) < len(multipliers) else multipliers[-1]
+                await query.edit_message_text(f"💎 Safe! Next: {next_mult}x", reply_markup=get_keyboard(game))
 
 # --- MAIN ---
 def main():
@@ -304,17 +365,28 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("daily", daily))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("bet", bet_menu))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("pay", pay))
-    app.add_handler(CommandHandler("bet", bet_game)) # /bet command
-    app.add_handler(CommandHandler("top", leaderboard))
     
-    app.add_handler(CallbackQueryHandler(game_callback))
+    # Shop Features
+    app.add_handler(CommandHandler("shop", shop_menu))
+    app.add_handler(CommandHandler("myitems", my_items))
+
+    app.add_handler(CommandHandler("cast", broadcast))       
+    app.add_handler(CommandHandler("code", create_code))     
+    app.add_handler(CommandHandler("redeem", redeem_code))   
     
-    print("🚀 Group Bot Started...")
+    app.add_handler(CommandHandler("loan", take_loan))
+    app.add_handler(CommandHandler("payloan", pay_loan))
+    app.add_handler(CommandHandler("add", add_money))
+    app.add_handler(CommandHandler("take", take_money))
+    app.add_handler(CallbackQueryHandler(callback_handler))
+    
+    print("🚀 Bot Started with SHOP & All Features...")
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
+                
